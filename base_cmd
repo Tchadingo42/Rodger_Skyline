@@ -1,0 +1,139 @@
+- logins : passwords
+root : password
+jdurand : password
+- installed packages
+        apt-get install sudo
+        apt-get install ssh
+        apt-get install ipset
+        apt-get install mailutils
+- check if everything is up to date
+        apt-get upgrade
+- create non-root user with sudo privileges
+        adduser name_user
+        adduser name_user sudo
+        visudo
+            (add line below # User privileges specification)
+            username    ALL=(ALL)   ALL
+- user static IP with /30 Netmask
+        vi /etc/network/interfaces
+            (comment line)
+            #iface enp0s3 inet dhcp
+            (add lines at end of file)
+            iface enp0s3 inet static
+            address 10.11.164.57 (e1 -> 10.11, e2 -> 10.12, e3 -> 10.13)
+            netmask 255.255.255.252
+            gateway 10.11.254.254
+- change default ssh port
+        vi /etc/ssh/sshd_config
+            (change line)
+            Port 4242
+- allow access from another PC with public key
+1 - virtualbox > vm settings > network > adapter 1 > bridged adapter
+2 - connect with password form client PC
+        ssh jdurand@10.11.164.57 -p 4242
+3 - generate key on client PC
+        ssh-keygen -b 4096
+4 - send key to server from client
+        ssh-copy-id -i ~/.ssh/id_rsa jdurand@10.11.164.57 -p 4242
+5 - change config to refuse password and root login
+        vi /etc/ssh/sshd_config
+            (change lines)
+            PermitRootLogin no
+            PubkeyAuthentication yes
+            PasswordAuthentication no
+            (add line)
+            RSAAuthentication yes
+- block all ports except 4242 + security against DOS
+1 - clean all firewall rules
+        iptables -t filter -F
+2 - allow input tcp links for port 4242 (with DOS protection), and related/established connexions
+        iptables -t filter -A INPUT -p tcp --dport 4242 -m limit --limit 50/minute --limit-burst 100 -j ACCEPT
+        iptables -A INPUT -m state --state RELATED,ESTABLISHED -j ACCEPT
+3 - block all other ports for input and forward
+        iptables -P INPUT DROP
+        iptables -P FORWARD DROP
+4 - create firewall_conf.sh
+        vi /etc/init.d/firewall_conf.sh
+            (add all lines in steps 1 to 3)
+        chmod +x firewall_conf.sh
+5 - update crontab
+        vi /etc/crontab
+            (add line)
+            @reboot root /etc/init.d/firewall_conf.sh
+6 - try to DOS this IP with slowloris
+        ./slowloris.py 10.13.150.50 -p 4242 -s 1000
+    (Check packages state on server with : iptables -L -v -n)
+- protect against port scanning
+1 - protection
+        ipset create port_scanners hash:ip family inet hashsize 32768 maxelem 65536 timeout 600
+        ipset create scanned_ports hash:ip,port family inet hashsize 32768 maxelem 65536 timeout 60
+        iptables -A INPUT -m state --state INVALID -j DROP
+        iptables -A INPUT -m state --state NEW -m set ! --match-set scanned_ports src,dst -m hashlimit --hashlimit-above 1/hour --hashlimit-burst 5 --hashlimit-mode srcip --hashlimit-name portscan --hashlimit-htable-expire 100000 -j SET --add-set port_scanners src --exist
+        iptables -A INPUT -m state --state NEW -m set --match-set port_scanners src -j DROP
+        iptables -A INPUT -m state --state NEW -j SET --add-set scanned_ports src,dst
+        (stores scanned ports in scanned_ports set
+        only counts newly scanned ports on the hashlimit rule
+        if a scanner sends packets to 5 different port (--hashlimit-burst 5) -> probably a scanner, so adds it to port_scanners set
+        timeout of port_scanners is the block time of scanners (10 minutes here)
+        starts counting from beginning (--exist) till attacker stops scanning for 100 seconds (--hashlimit-htable-expire 100000)
+2 - try to scan ports with nmap (from other VM)
+        nmap -Pn 10.13.164.57
+3 - create ipset_creation.sh
+        vi /etc/init.d/ipset_creation.sh
+            (add all ipset commands in step 1)
+        chmod +x ipset_creation.sh
+4 - update firewall_conf.sh
+        vi /etc/init.d/firewall_conf.sh
+            (add all iptables commands in step 1 below the first line)
+5 - update crontab
+        vi /etc/crontab
+            (add line BEFORE firewall_conf.sh)
+            @reboot root /etc/init.d/ipset_creation.sh
+- stop useless services
+1 - list services
+        service --status-all
+2 - stop services
+        systemctl stop <service>
+3 - disable service (to prevent it to run at startup)
+        systemctl disable <service>
+4 - re-enable : systemctl enable <service>, re-start : systemctl start <service>, check status : systemctl status <service>
+- script updating all sources of packages, then all packages
+1 - commands in script
+        apt-get upgrade >> /var/log/update_script.log;
+        apt-get update -y >> /var/log/update_script.log;
+2 - create upgrade_update.sh
+        vi /etc/init.d/upgrade_update.sh
+            (add all lines in step 1)
+        chmod +x upgrade_update.sh
+3 - update crontab
+        vi /etc/crontab
+            (add lines)
+            @reboot root /etc/init.d/upgrade_update.sh
+            0 4 */7 * * root /etc/init.d/upgrade_update.sh
+- script checking modifications in crontab file
+1 - commands in script
+        a=$(cmp /etc/crontab /etc/init.d/last_crontab);
+        [ ! -z "$a" ] && echo "Crontab file was changed today" | mail -s "Crontab changed" root;
+        cat /etc/crontab > /etc/init.d/last_crontab;
+2 - create check_crontab.sh
+        vi /etc/init.d/check_crontab.sh
+            (add all lines in step 1)
+        chmod +x check_crontab.sh
+3 - update crontab
+        vi /etc/crontab
+            (add line)
+            0 0 * * * root /etc/init.d/check_crontab.sh
+NOTES POUR LA CORRECTION
+- savoir changer le masque
+    vi /etc/network/interfaces
+        mettre 255.255.255.248 au lieu de 255.255.255.252 
+        remettre 255.255.255.252 apres avoir check ce point, sinon les ipset ne marchent pas
+- installer Fail2Ban
+    bloque pour X secondes au bout de X essais de password
+    redondant avec les regles iptables mais demande pendant la correction
+- root mail a changer
+    vi /etc/aliases
+        enlever la ligne root: login
+        (NON TESTE)
+    aussi possible de changer le script check_crontab.sh
+        mail -s "Crontab changed" root; a remplacer par mail -s "Crontab changed" root@debian;
